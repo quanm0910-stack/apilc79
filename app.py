@@ -20,7 +20,7 @@ MAX_GLOBAL_HISTORY = 2000
 latest_prediction = None
 prediction_version = 0
 api_error_msg = None 
-is_fetching = False # Cờ chống gọi API trùng lặp
+is_fetching = False
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
@@ -201,7 +201,7 @@ def realtime_worker():
             fetch_and_update()
         except Exception as e:
             print(f"[WORKER CRASH] {e}")
-        time.sleep(1.5) # Poll mỗi 1.5s
+        time.sleep(1.5)
 
 # ================== GIAO DIỆN HTML ==================
 HTML_PAGE = """<!DOCTYPE html>
@@ -360,7 +360,6 @@ def add_headers(resp):
 @app.route("/")
 @app.route("/predict")
 def predict_page():
-    # F5 sẽ kích hoạt gọi API luôn để lấy dữ liệu mới nhất
     fetch_and_update()
     return Response(render_html(), mimetype="text/html; charset=utf-8")
 
@@ -380,15 +379,50 @@ def dudoan():
         fetch_and_update()
     if not latest_prediction:
         return Response(json.dumps({"status": "waiting", "message": "Chưa có dữ liệu"}, ensure_ascii=False), mimetype="application/json; charset=utf-8")
+    
+    p = latest_prediction
+    
+    # 1. Chuẩn bị dữ liệu Xúc xắc (Ví dụ: 6-5-2)
+    dice_list = p.get("last_dice", [])
+    chi_tiet_str = "-".join(map(str, dice_list)) if dice_list else "N/A"
+    
+    # 2. Chuẩn bị dữ liệu Cầu Tài Xỉu (Dạng chuỗi: TXXTT...)
+    history_seq = p.get("history_seq", [])
+    cau_str = "".join("T" if s == "Tài" else "X" for s in history_seq)
+    
+    # 3. Tính Đúng / Sai của ván trước (Dựa vào file history.json)
+    prev_status = "N/A"
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                hist = json.load(f)
+                if len(hist) >= 1:
+                    last_record = hist[-1]
+                    # Nếu last_record là phiên vừa xong thì so sánh
+                    if last_record.get("phien") == p["session"]:
+                        # so sánh dự đoán của phiên trước đó với kết quả thực tế của phiên vừa xong
+                        if last_record.get("du_doan") == ("TAI" if p["last_result"] == "Tài" else "XIU"):
+                            prev_status = "ĐÚNG"
+                        else:
+                            prev_status = "SAI"
+        except Exception:
+            pass
+
+    # 4. Trả về JSON chuẩn cho Bot
     return Response(json.dumps({
-        "status": "ok", "du_doan": latest_prediction["du_doan"],
-        "do_tin_cay": f"{latest_prediction['do_tin_cay']:.1f}%", "phien": latest_prediction["session"],
-        "chi_tiet": latest_prediction["detail"]
+        "status": "ok", 
+        "phien": p["predict_for_session"],
+        "ket_qua": "TÀI" if p["last_result"] == "Tài" else "XỈU",
+        "chi_tiet": chi_tiet_str,
+        "tong": p["last_total"],
+        "du_doan": p["du_doan"],
+        "ti_le": round(p["do_tin_cay"], 1),
+        "cau": cau_str,
+        "van_truoc": prev_status
     }, ensure_ascii=False, indent=2), mimetype="application/json; charset=utf-8")
 
 # ================== START ==================
 if __name__ == "__main__":
-    # Khởi động luồng lấy dữ liệu ngầm
     threading.Thread(target=realtime_worker, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, threaded=True)
