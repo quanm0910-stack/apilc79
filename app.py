@@ -19,30 +19,20 @@ GLOBAL_HISTORY = []
 MAX_GLOBAL_HISTORY = 2000
 latest_prediction = None
 prediction_version = 0
-api_error_msg = None # Lưu lỗi API (nếu có) để hiển thị ra màn hình
+api_error_msg = None 
+is_fetching = False # Cờ chống gọi API trùng lặp
 
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
     "Referer": "https://tele68.com/",
     "Origin": "https://tele68.com",
     "Cache-Control": "no-store",
+    "Connection": "keep-alive"
 }
 
-# ================== LỊCH SỬ FILE ==================
-def load_history():
-    if not os.path.exists(HISTORY_FILE): return []
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f: return json.load(f)
-    except: return []
-
-def save_history(history):
-    with lock:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-
-# ================== THUẬT TOÁN MỚI (V3) ==================
+# ================== THUẬT TOÁN DỰ ĐOÁN V3 ==================
 def _recent_weighted(recent, decay=1.0):
     tai_w = xiu_w = 0.0
     n = len(recent)
@@ -98,7 +88,6 @@ def prediction(history):
 
     m = _momentum(seq, 5, 15)
     p_momentum = 0.5 + max(-0.18, min(0.18, m))
-
     p_markov = (_markov(seq, 2, 3) * 0.6) + (_markov(seq, 3, 3) * 0.4)
 
     last20 = seq[-20:]
@@ -113,95 +102,106 @@ def prediction(history):
     conf = round(min(82, max(50, conf_raw + edge * 6 * sample_factor)), 1)
 
     return {
-        "side": side,
-        "conf": conf,
+        "side": side, "conf": conf,
         "detail": {
-            "p_tai": round(p_tai * 100, 2),
-            "p_weighted": round(p_weighted * 100, 2),
-            "p_streak": round(p_streak * 100, 2),
-            "p_momentum": round(p_momentum * 100, 2),
-            "p_markov": round(p_markov * 100, 2),
-            "p_mr": round(p_mr * 100, 2),
-            "streak": streak,
-            "last_side": last_side,
+            "p_tai": round(p_tai * 100, 2), "p_weighted": round(p_weighted * 100, 2),
+            "p_streak": round(p_streak * 100, 2), "p_momentum": round(p_momentum * 100, 2),
+            "p_markov": round(p_markov * 100, 2), "p_mr": round(p_mr * 100, 2),
+            "streak": streak, "last_side": last_side,
         }
     }
 
-# ================== CALL API ==================
-def parse_sessions(data):
-    if "error" in data or "list" not in data: return []
-    out = []
-    for s in data.get("list", []):
-        res = (s.get("resultTruyenThong") or "").upper()
-        if res in ("TAI", "XIU"):
-            out.append({
-                "session": s.get("id"),
-                "dice": s.get("dices", []),
-                "total": s.get("point", 0),
-                "side": "Tài" if res == "TAI" else "Xỉu",
-            })
-    out.sort(key=lambda x: x["session"] or 0)
-    return out
-
-# ================== WORKER REALTIME ==================
-def realtime_worker():
-    global GLOBAL_HISTORY, latest_prediction, prediction_version, api_error_msg
+# ================== CALL API & UPDATE ==================
+def fetch_and_update():
+    global GLOBAL_HISTORY, latest_prediction, prediction_version, api_error_msg, is_fetching
     
+    if is_fetching: return False
+    is_fetching = True
+    
+    try:
+        url = f"{SOURCE_API}&_t={int(time.time() * 1000)}"
+        r = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
+        
+        if r.status_code != 200:
+            api_error_msg = f"Lỗi HTTP {r.status_code} (Bị chặn IP?)"
+            print(f"[API ERROR] HTTP {r.status_code}")
+            is_fetching = False
+            return False
+
+        data = r.json()
+        if "list" not in data:
+            api_error_msg = "API không trả về danh sách phiên."
+            print(f"[API ERROR] Không có list: {str(data)[:100]}")
+            is_fetching = False
+            return False
+
+        sessions = []
+        for s in data.get("list", []):
+            res = (s.get("resultTruyenThong") or "").upper()
+            if res in ("TAI", "XIU"):
+                sessions.append({
+                    "session": s.get("id"), "dice": s.get("dices", []),
+                    "total": s.get("point", 0), "side": "Tài" if res == "TAI" else "Xỉu",
+                })
+        sessions.sort(key=lambda x: x["session"] or 0)
+        
+        if not sessions:
+            api_error_msg = "Không có dữ liệu TAI/XIU."
+            is_fetching = False
+            return False
+            
+        api_error_msg = None
+        GLOBAL_HISTORY = sessions[-MAX_GLOBAL_HISTORY:]
+        newest = sessions[-1]
+        
+        if not latest_prediction or latest_prediction["session"] != newest["session"]:
+            pred = prediction(GLOBAL_HISTORY)
+            if pred["side"] in ("Tài", "Xỉu"):
+                latest_prediction = {
+                    "session": newest["session"], "predict_for_session": newest["session"] + 1,
+                    "du_doan": "TAI" if pred["side"] == "Tài" else "XIU", "side": pred["side"],
+                    "do_tin_cay": pred["conf"], "detail": pred["detail"],
+                    "last_result": newest["side"], "last_dice": newest["dice"], "last_total": newest["total"],
+                    "history_seq": [h["side"] for h in GLOBAL_HISTORY[-20:]],
+                    "thoi_gian": datetime.now().strftime("%H:%M:%S • %d/%m/%Y"),
+                }
+                prediction_version += 1
+                
+                # Ghi file lịch sử
+                hist = []
+                if os.path.exists(HISTORY_FILE):
+                    try:
+                        with open(HISTORY_FILE, "r", encoding="utf-8") as f: hist = json.load(f)
+                    except: pass
+                    
+                if not any(h.get("phien") == newest["session"] for h in hist):
+                    hist.append({
+                        "phien": newest["session"], "du_doan": latest_prediction["du_doan"],
+                        "do_tin_cay": f"{pred['conf']:.1f}%", "ket_qua_phien": newest["side"],
+                        "thoi_gian": datetime.now().isoformat(timespec="seconds"),
+                    })
+                    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                        json.dump(hist, f, ensure_ascii=False, indent=2)
+                
+                print(f"[NEW SESSION] Phiên {newest['session']} -> Dự đoán: {latest_prediction['du_doan']}")
+        
+        is_fetching = False
+        return True
+    except Exception as e:
+        api_error_msg = f"Lỗi mạng: {str(e)[:50]}"
+        print(f"[EXCEPTION] {str(e)}")
+        is_fetching = False
+        return False
+
+# ================== WORKER CHẠY NGẦM ==================
+def realtime_worker():
+    print("=== STARTING WORKER ===")
     while True:
         try:
-            url = f"{SOURCE_API}&_t={int(time.time() * 1000)}"
-            r = requests.get(url, headers=BROWSER_HEADERS, timeout=10)
-            data = r.json()
-            
-            if "list" not in data:
-                api_error_msg = "API không trả về danh sách phiên."
-                time.sleep(3)
-                continue
-
-            sessions = parse_sessions(data)
-            if not sessions:
-                api_error_msg = "Không có dữ liệu TAI/XIU."
-                time.sleep(3)
-                continue
-                
-            api_error_msg = None # Xoá lỗi nếu fetch thành công
-            GLOBAL_HISTORY = sessions[-MAX_GLOBAL_HISTORY:]
-            newest = sessions[-1]
-            
-            # Nếu có phiên mới HOẶC chưa có dự đoán nào
-            if not latest_prediction or latest_prediction["session"] != newest["session"]:
-                pred = prediction(GLOBAL_HISTORY)
-                if pred["side"] in ("Tài", "Xỉu"):
-                    latest_prediction = {
-                        "session": newest["session"],
-                        "predict_for_session": newest["session"] + 1,
-                        "du_doan": "TAI" if pred["side"] == "Tài" else "XIU",
-                        "side": pred["side"],
-                        "do_tin_cay": pred["conf"],
-                        "detail": pred["detail"],
-                        "last_result": newest["side"],
-                        "last_dice": newest["dice"],
-                        "last_total": newest["total"],
-                        "history_seq": [h["side"] for h in GLOBAL_HISTORY[-20:]],
-                        "thoi_gian": datetime.now().strftime("%H:%M:%S • %d/%m/%Y"),
-                    }
-                    prediction_version += 1
-                    
-                    hist = load_history()
-                    if not any(h.get("phien") == newest["session"] for h in hist):
-                        hist.append({
-                            "phien": newest["session"],
-                            "du_doan": latest_prediction["du_doan"],
-                            "do_tin_cay": f"{pred['conf']:.1f}%",
-                            "ket_qua_phien": newest["side"],
-                            "thoi_gian": datetime.now().isoformat(timespec="seconds"),
-                        })
-                        save_history(hist)
-            
-            time.sleep(1.5) # Poll mỗi 1.5s
+            fetch_and_update()
         except Exception as e:
-            api_error_msg = f"Lỗi mạng: {str(e)}"
-            time.sleep(4) # Lỗi thì nghỉ lâu hơn chút
+            print(f"[WORKER CRASH] {e}")
+        time.sleep(1.5) # Poll mỗi 1.5s
 
 # ================== GIAO DIỆN HTML ==================
 HTML_PAGE = """<!DOCTYPE html>
@@ -271,7 +271,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
   <div class="card">
     <div class="header">
-      <div class="logo"><span class="dot"></span> AI PREDICTOR · LIVE v3</div>
+      <div class="logo"><span class="dot"></span> AI PREDICTOR · LIVE v4</div>
       <h1>TXMD5 Predictor</h1>
     </div>
     <div id="app-content">{content}</div>
@@ -304,6 +304,7 @@ def render_content():
         <div class="error">
           <span class="emoji">⚠️</span>
           Lỗi kết nối API<br><small style="opacity:.7">{api_error_msg}</small>
+          <div style="margin-top:20px; font-size:12px; color:#8b96c9">Hãy thử tải lại trang (F5)</div>
         </div>'''
         
     p = latest_prediction
@@ -311,15 +312,14 @@ def render_content():
         return '''
         <div class="error">
           <span class="emoji">⏳</span>
-          Đang chờ phiên mới từ API...<br>
-          <small style="opacity:.7">Hệ thống sẽ tự cập nhật khi có kết quả</small>
+          Đang kết nối tới API...<br>
+          <small style="opacity:.7">Vui lòng đợi trong giây lát (Render có thể mất 50s để khởi động)</small>
         </div>'''
 
     side = p["side"]
     cls = "tai" if side == "Tài" else "xiu"
     conf = p["do_tin_cay"]
     d = p["detail"]
-
     chips = "".join(f'<div class="chip {"t" if s=="Tài" else "x"}">{s[0]}</div>' for s in p["history_seq"][-20:])
     res_text = "TAI" if p["last_result"] == "Tài" else "XIU"
 
@@ -327,9 +327,7 @@ def render_content():
     <div class="prediction {cls}">
       <div class="pred-label">Dự đoán phiên {p["predict_for_session"]}</div>
       <div class="pred-value">{p["du_doan"]}</div>
-      <div class="conf-badge">
-        🎯 {conf:.1f}% <span class="live-tag">● LIVE</span>
-      </div>
+      <div class="conf-badge">🎯 {conf:.1f}% <span class="live-tag">● LIVE</span></div>
     </div>
     <div class="info-grid">
       <div class="info-row"><span class="label">🔢 Phiên vừa xong</span><span class="value">{p["session"]}</span></div>
@@ -362,10 +360,14 @@ def add_headers(resp):
 @app.route("/")
 @app.route("/predict")
 def predict_page():
+    # F5 sẽ kích hoạt gọi API luôn để lấy dữ liệu mới nhất
+    fetch_and_update()
     return Response(render_html(), mimetype="text/html; charset=utf-8")
 
 @app.route("/api/live")
 def api_live():
+    if not latest_prediction:
+        fetch_and_update()
     return Response(json.dumps({
         "version": prediction_version,
         "html": render_content(),
@@ -375,19 +377,14 @@ def api_live():
 @app.route("/dudoan")
 def dudoan():
     if not latest_prediction:
-        return Response(json.dumps({"status": "waiting", "message": "Chưa có phiên mới"}, ensure_ascii=False), mimetype="application/json; charset=utf-8")
+        fetch_and_update()
+    if not latest_prediction:
+        return Response(json.dumps({"status": "waiting", "message": "Chưa có dữ liệu"}, ensure_ascii=False), mimetype="application/json; charset=utf-8")
     return Response(json.dumps({
         "status": "ok", "du_doan": latest_prediction["du_doan"],
         "do_tin_cay": f"{latest_prediction['do_tin_cay']:.1f}%", "phien": latest_prediction["session"],
         "chi_tiet": latest_prediction["detail"]
     }, ensure_ascii=False, indent=2), mimetype="application/json; charset=utf-8")
-
-@app.route("/history")
-def history_page():
-    h = load_history()
-    rows = "".join(f'<div class="info-row"><span class="label">🔢 {x.get("phien")}</span><span class="value">{x.get("du_doan")} • {x.get("do_tin_cay")}</span></div>' for x in reversed(h[-30:])) or '<p style="text-align:center;color:#6b76a8;padding:20px">Chưa có lịch sử</p>'
-    content = f'<div class="header" style="margin-bottom:18px"><h1 style="font-size:20px">📜 Lịch sử</h1><p style="color:#8b96c9;font-size:12px;margin-top:6px">Tổng: {len(h)} phiên</p></div><div class="info-grid">{rows}</div>'
-    return Response(HTML_PAGE.format(content=content, credit=CREDIT, version=prediction_version), mimetype="text/html; charset=utf-8")
 
 # ================== START ==================
 if __name__ == "__main__":
