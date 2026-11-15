@@ -5,6 +5,7 @@ import threading
 import requests
 from flask import Flask, Response, request
 from datetime import datetime
+from collections import deque
 
 app = Flask(__name__)
 
@@ -13,6 +14,14 @@ HISTORY_FILE = "history.json"
 CREDIT = "chủ nguồn api @Duykhanhios"
 
 lock = threading.Lock()
+
+# ===== STATE TOÀN CỤC (real-time) =====
+GLOBAL_HISTORY = []          # list các dict {session, dice, total, side}
+MAX_GLOBAL_HISTORY = 2000
+latest_api_session_id = None
+latest_prediction = None      # dict dự đoán mới nhất
+prediction_version = 0        # tăng mỗi khi có dự đoán mới -> SSE client biết có update
+last_poll_ts = 0
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -24,10 +33,11 @@ BROWSER_HEADERS = {
     "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
     "Referer": "https://tele68.com/",
     "Origin": "https://tele68.com",
+    "Cache-Control": "no-store",
 }
 
 
-# ================== LỊCH SỬ ==================
+# ================== LỊCH SỬ FILE ==================
 def load_history():
     if not os.path.exists(HISTORY_FILE):
         return []
@@ -44,931 +54,472 @@ def save_history(history):
             json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-# ================== GỌI NGUỒN ==================
+# ================== THUẬT TOÁN MỚI ==================
+def _recent_weighted(recent, decay=1.0):
+    """Weighted vote trên N phiên gần nhất, phiên càng mới weight càng cao."""
+    tai_w = xiu_w = 0.0
+    n = len(recent)
+    for i, s in enumerate(recent):
+        w = (i + 1) * (decay ** (n - 1 - i))  # càng mới càng nặng
+        if s == "Tài":
+            tai_w += w
+        else:
+            xiu_w += w
+    return tai_w, xiu_w
+
+
+def _streak_info(seq):
+    """Trả về (side_last, streak_len)."""
+    if not seq:
+        return None, 0
+    last = seq[-1]
+    s = 1
+    i = len(seq) - 2
+    while i >= 0 and seq[i] == last:
+        s += 1
+        i -= 1
+    return last, s
+
+
+def _momentum(seq, short=5, long=15):
+    """Chênh lệch tỉ lệ Tài giữa ngắn hạn và dài hạn (momentum)."""
+    n = len(seq)
+    if n < long:
+        return 0.0
+    p_short = seq[-short:].count("Tài") / short
+    p_long = seq[-long:].count("Tài") / long
+    return p_short - p_long
+
+
+def _markov(seq, order=2, min_samples=3):
+    """Markov bậc order — xác suất Tài sau context hiện tại."""
+    n = len(seq)
+    if n < order + min_samples:
+        return 0.5
+    ctx = seq[-order:]
+    ct = cx = 0
+    for i in range(n - order):
+        if seq[i:i + order] == ctx:
+            if seq[i + order] == "Tài":
+                ct += 1
+            else:
+                cx += 1
+    tot = ct + cx
+    if tot < min_samples:
+        return 0.5
+    return (ct + 0.5) / (tot + 1)  # Laplace smoothing
+
+
+def prediction(history):
+    """
+    Thuật toán dự đoán mới — kết hợp:
+      1. Weighted recent 12 phiên (thuật toán gốc trong tt ngắn gọn)
+      2. Streak analysis (bám cầu / bẻ cầu)
+      3. Momentum 5 vs 15
+      4. Markov bậc 2 & 3
+      5. Mean-reversion khi lệch nhiều
+    Trả về dict {side, conf, score_detail}
+    """
+    if not history or len(history) < 8:
+        return {"side": "Đang chờ dữ liệu", "conf": 0, "detail": {}}
+
+    seq = [h["side"] for h in history]  # "Tài" / "Xỉu"
+    recent12 = seq[-12:]
+
+    # 1) Weighted recent 12 (gốc)
+    tai_w, xiu_w = _recent_weighted(recent12)
+    tot_w = tai_w + xiu_w
+    if tot_w == 0:
+        p_weighted = 0.5
+    else:
+        p_weighted = tai_w / tot_w  # xác suất Tài
+    edge = abs(tai_w - xiu_w) / tot_w if tot_w else 0
+
+    # 2) Streak
+    last_side, streak = _streak_info(seq)
+    if streak <= 2:
+        p_streak = 0.62 if last_side == "Tài" else 0.38   # bám cầu ngắn
+    elif streak >= 7:
+        p_streak = 0.30 if last_side == "Tài" else 0.70   # bẻ cầu dài
+    else:
+        p_streak = 0.52 if last_side == "Tài" else 0.48
+
+    # 3) Momentum
+    m = _momentum(seq, 5, 15)
+    p_momentum = 0.5 + max(-0.18, min(0.18, m))
+
+    # 4) Markov
+    p_m2 = _markov(seq, 2, 3)
+    p_m3 = _markov(seq, 3, 3)
+    p_markov = (p_m2 * 0.6 + p_m3 * 0.4)
+
+    # 5) Mean reversion (nếu 20 phiên lệch > 65%)
+    last20 = seq[-20:]
+    p20 = last20.count("Tài") / len(last20) if last20 else 0.5
+    if p20 >= 0.68:
+        p_mr = 0.36
+    elif p20 <= 0.32:
+        p_mr = 0.64
+    else:
+        p_mr = 0.5
+
+    # Blend có trọng số
+    # weighted: 0.30, streak: 0.18, momentum: 0.14, markov: 0.28, MR: 0.10
+    p_tai = (
+        p_weighted * 0.30
+        + p_streak * 0.18
+        + p_momentum * 0.14
+        + p_markov * 0.28
+        + p_mr * 0.10
+    )
+
+    side = "Tài" if p_tai >= 0.5 else "Xỉu"
+    conf_raw = max(p_tai, 1 - p_tai) * 100
+
+    # Boost theo edge + sample
+    sample_factor = min(len(recent12) / 12, 1)
+    conf = conf_raw + edge * 6 * sample_factor
+    conf = round(min(82, max(50, conf)), 1)
+
+    return {
+        "side": side,
+        "conf": conf,
+        "detail": {
+            "p_tai": round(p_tai * 100, 2),
+            "p_weighted": round(p_weighted * 100, 2),
+            "p_streak": round(p_streak * 100, 2),
+            "p_momentum": round(p_momentum * 100, 2),
+            "p_markov": round(p_markov * 100, 2),
+            "p_mr": round(p_mr * 100, 2),
+            "edge": round(edge * 100, 2),
+            "streak": streak,
+            "last_side": last_side,
+        },
+    }
+
+
+# ================== API CALL ==================
 def fetch_source():
+    global last_poll_ts
     try:
-        r = requests.get(SOURCE_API, headers=BROWSER_HEADERS, timeout=15)
+        url = f"{SOURCE_API}&_t={int(time.time() * 1000)}"
+        r = requests.get(url, headers=BROWSER_HEADERS, timeout=8)
         r.raise_for_status()
+        last_poll_ts = time.time()
         return r.json()
     except Exception as e:
         return {"error": str(e)}
 
 
-def get_seq(data):
+def parse_sessions(data):
+    """Chuẩn hoá list phiên từ API."""
     if "error" in data or "list" not in data:
         return []
-    rows = []
-    for item in data["list"]:
-        res = item.get("resultTruyenThong")
+    out = []
+    for s in data["list"]:
+        res = (s.get("resultTruyenThong") or "").upper()
         if res in ("TAI", "XIU"):
-            rows.append(res)
-    rows.reverse()
-    return rows[-40:]
+            out.append({
+                "session": s.get("id"),
+                "dice": s.get("dices", []),
+                "total": s.get("point", 0),
+                "side": "Tài" if res == "TAI" else "Xỉu",
+            })
+    # sort tăng dần theo id để lịch sử cũ -> mới
+    out.sort(key=lambda x: x["session"] or 0)
+    return out
+
+
+# ================== WORKER POLL NHANH ==================
+def realtime_worker():
+    """
+    Poll API mỗi ~1.2s. Khi phát hiện phiên mới (id thay đổi):
+      - Cập nhật GLOBAL_HISTORY
+      - Chạy prediction() trên lịch sử mới
+      - Lưu latest_prediction + tăng prediction_version
+      - Ghi vào file history
+    """
+    global latest_api_session_id, latest_prediction, prediction_version, GLOBAL_HISTORY
 
-
-# ================== THUẬT TOÁN (giữ nguyên) ==================
-def v1_ctw(seq):
-    n = len(seq)
-    if n < 10:
-        return 0.5
-    best_p, best_n = 0.5, 0
-    for d in range(min(6, n - 1), 0, -1):
-        ctx = "|".join(seq[-d:])
-        ct = cx = 0
-        for i in range(n - d):
-            if "|".join(seq[i:i + d]) != ctx:
-                continue
-            if seq[i + d] == "TAI":
-                ct += 1
-            else:
-                cx += 1
-        tot = ct + cx
-        if tot >= 3 and tot > best_n:
-            best_p = (ct + 0.5) / (tot + 1)
-            best_n = tot
-    return best_p
-
-
-def v1_pattern(seq):
-    n = len(seq)
-    if n < 8:
-        return 0.5
-    best_p, best_l = 0.5, 0
-    for L in range(2, min(6, n - 1) + 1):
-        ctx = "|".join(seq[-L:])
-        ct = cx = 0
-        for i in range(n - L):
-            if "|".join(seq[i:i + L]) != ctx:
-                continue
-            if seq[i + L] == "TAI":
-                ct += 1
-            else:
-                cx += 1
-        tot = ct + cx
-        if tot >= 3 and L > best_l:
-            best_p = (ct + 0.5) / (tot + 1)
-            best_l = L
-    return best_p
-
-
-def v1_streak(seq):
-    n = len(seq)
-    if not n:
-        return 0.5
-    last = seq[-1]
-    s = 1
-    i = n - 2
-    while i >= 0 and seq[i] == last:
-        s += 1
-        i -= 1
-    if s == 1:
-        return 0.55 if last == "TAI" else 0.45
-
-    signals_theo = signals_be = same_theo = same_be = 0
-    i = 1
-    while i < n - s:
-        cur = seq[i]
-        blen = 1
-        j = i - 1
-        while j >= 0 and seq[j] == cur:
-            blen += 1
-            j -= 1
-        if blen == s and i + 1 < n:
-            if seq[i + 1] == cur:
-                same_theo += 1
-            else:
-                same_be += 1
-        i += 1
-
-    total_hist = same_theo + same_be
-    if total_hist >= 3:
-        if same_theo > same_be * 1.3:
-            signals_theo += 2
-        elif same_be > same_theo * 1.3:
-            signals_be += 2
-
-    if n >= 5:
-        last5 = seq[-5:]
-        if len(set(last5)) == 1:
-            signals_theo += 1
-        elif last5.count(last5[0]) == 4:
-            signals_be += 1
-
-    last10 = seq[-10:]
-    p = last10.count("TAI") / len(last10)
-    if p >= 0.7 or p <= 0.3:
-        signals_theo += 1
-    elif 0.45 <= p <= 0.55:
-        signals_be += 1
-
-    if s <= 3:
-        signals_theo += 2
-    elif 7 <= s <= 9:
-        signals_be += 1
-    elif s >= 10:
-        signals_be += 3
-
-    if signals_theo > signals_be:
-        conf = 0.55 + min(0.10, (signals_theo - signals_be) * 0.03)
-        return conf if last == "TAI" else 1 - conf
-    if signals_be > signals_theo:
-        conf = 0.50 + min(0.15, (signals_be - signals_theo) * 0.03)
-        return 1 - conf if last == "TAI" else conf
-    return 0.55 if last == "TAI" else 0.45
-
-
-def v1_freq(seq, w=10):
-    r = seq[-w:]
-    return r.count("TAI") / len(r) if r else 0.5
-
-
-def v1_entropy(seq, w=10):
-    r = seq[-w:]
-    if not r:
-        return 0.5
-    p = r.count("TAI") / len(r)
-    if p == 0 or p == 1:
-        return p
-    import math
-    H = -(p * math.log2(p) + (1 - p) * math.log2(1 - p))
-    return 0.5 if H >= 0.9 else p
-
-
-def v1_recent_transition(seq):
-    n = len(seq)
-    if n < 6:
-        return 0.5
-    r = seq[-10:]
-    tt = tx = xx = xt = 0
-    for i in range(1, len(r)):
-        a, b = r[i - 1], r[i]
-        if a == "TAI" and b == "TAI":
-            tt += 1
-        elif a == "TAI" and b == "XIU":
-            tx += 1
-        elif a == "XIU" and b == "XIU":
-            xx += 1
-        elif a == "XIU" and b == "TAI":
-            xt += 1
-    last = r[-1]
-    same = tt if last == "TAI" else xx
-    flip = tx if last == "TAI" else xt
-    total = same + flip
-    if total < 3:
-        return 0.5
-    p = same / total
-    return (p * 0.55 + (1 - p) * 0.45) if last == "TAI" else ((1 - p) * 0.55 + p * 0.45)
-
-
-def v1_cau(seq):
-    n = len(seq)
-    if n < 8:
-        return 0.5
-    last = seq[-1]
-    sigs = []
-    s = 1
-    i = n - 2
-    while i >= 0 and seq[i] == last:
-        s += 1
-        i -= 1
-
-    l7 = seq[-7:]
-    changes = sum(1 for i in range(1, len(l7)) if l7[i] != l7[i - 1])
-
-    if n >= 6:
-        l6 = seq[-6:]
-        if l6[0] == l6[1] and l6[2] == l6[3] and l6[4] == l6[5] \
-                and l6[0] != l6[2] and l6[2] != l6[4]:
-            sigs.append((l6[4], 2.5))
-    if n >= 6:
-        l6 = seq[-6:]
-        if l6[0] == l6[1] == l6[2] and l6[3] == l6[4] == l6[5] and l6[0] != l6[3]:
-            sigs.append(("XIU" if l6[3] == "TAI" else "TAI", 2.3))
-    if changes >= 5:
-        sigs.append(("XIU" if last == "TAI" else "TAI", 2.5))
-    if 2 <= s <= 4:
-        sigs.append((last, 1.8))
-    elif s >= 8:
-        sigs.append(("XIU" if last == "TAI" else "TAI", 2.8))
-
-    if not sigs:
-        return 0.5
-    st = sum(w for side, w in sigs if side == "TAI")
-    sx = sum(w for side, w in sigs if side == "XIU")
-    return st / (st + sx) if (st + sx) else 0.5
-
-
-def algo_v1(seq):
-    signals = [v1_ctw(seq), v1_pattern(seq), v1_streak(seq), v1_freq(seq),
-               v1_entropy(seq), v1_cau(seq), v1_recent_transition(seq)]
-    weights = [1.5, 1.5, 2.0, 1.0, 0.8, 2.3, 1.2]
-    return sum(s * w for s, w in zip(signals, weights)) / sum(weights)
-
-
-def v2_markov2(seq):
-    n = len(seq)
-    if n < 20:
-        return 0.5
-    ctx = "|".join(seq[-2:])
-    ct = cx = 0
-    for i in range(n - 2):
-        if "|".join(seq[i:i + 2]) != ctx:
-            continue
-        if seq[i + 2] == "TAI":
-            ct += 1
-        else:
-            cx += 1
-    tot = ct + cx
-    return (ct + 0.5) / (tot + 1) if tot >= 3 else 0.5
-
-
-def v2_markov3(seq):
-    n = len(seq)
-    if n < 30:
-        return 0.5
-    ctx = "|".join(seq[-3:])
-    ct = cx = 0
-    for i in range(n - 3):
-        if "|".join(seq[i:i + 3]) != ctx:
-            continue
-        if seq[i + 3] == "TAI":
-            ct += 1
-        else:
-            cx += 1
-    tot = ct + cx
-    return (ct + 0.5) / (tot + 1) if tot >= 3 else 0.5
-
-
-def v2_cycle(seq):
-    n = len(seq)
-    if n < 20:
-        return 0.5
-    for period in (2, 3, 4):
-        if n < period * 3:
-            continue
-        matches = total = 0
-        for i in range(n - period * 3, n - period):
-            if i < 0:
-                continue
-            if seq[i] == seq[i + period]:
-                matches += 1
-            total += 1
-        if total >= period * 2 and matches / total >= 0.75:
-            return 0.62 if seq[n - 1 - period] == "TAI" else 0.38
-    return 0.5
-
-
-def v2_momentum(seq):
-    n = len(seq)
-    if n < 20:
-        return 0.5
-    p5 = seq[-5:].count("TAI") / 5
-    p15 = seq[-15:].count("TAI") / 15
-    d = p5 - p15
-    if d > 0.20:
-        return 0.65
-    if d < -0.20:
-        return 0.35
-    if d > 0.10:
-        return 0.58
-    if d < -0.10:
-        return 0.42
-    return 0.5
-
-
-def v2_mean_reversion(seq):
-    n = len(seq)
-    if n < 20:
-        return 0.5
-    p = seq[-20:].count("TAI") / 20
-    if p >= 0.65:
-        return 0.35
-    if p <= 0.35:
-        return 0.65
-    return 0.5
-
-
-def algo_v2(seq):
-    signals = [v2_markov2(seq), v2_markov3(seq), v2_cycle(seq),
-               v2_momentum(seq), v2_mean_reversion(seq)]
-    weights = [1.8, 2.0, 1.5, 1.5, 1.5]
-    return sum(s * w for s, w in zip(signals, weights)) / sum(weights)
-
-
-def analyze(seq, v1_acc=None, v2_acc=None):
-    v1_acc = v1_acc or []
-    v2_acc = v2_acc or []
-    p_v1 = algo_v1(seq)
-    p_v2 = algo_v2(seq)
-
-    def avg(a):
-        return sum(a) / len(a) if a else 0.5
-
-    v1_score = avg(v1_acc[-5:]) * 0.6 + avg(v1_acc[-15:]) * 0.4
-    v2_score = avg(v2_acc[-5:]) * 0.6 + avg(v2_acc[-15:]) * 0.4
-    v1_conf = abs(p_v1 - 0.5) * 2
-    v2_conf = abs(p_v2 - 0.5) * 2
-    both_agree = (p_v1 >= 0.5) == (p_v2 >= 0.5)
-
-    if len(v1_acc) < 10 and len(v2_acc) < 10:
-        p_tai, version = p_v1, "V1"
-    elif len(v1_acc) < 10:
-        p_tai, version = p_v2, "V2"
-    elif len(v2_acc) < 10:
-        p_tai, version = p_v1, "V1"
-    elif both_agree:
-        if v1_score > v2_score:
-            w1, w2 = 0.65, 0.35
-        elif v2_score > v1_score:
-            w1, w2 = 0.35, 0.65
-        else:
-            w1, w2 = 0.5, 0.5
-        p_tai = p_v1 * w1 + p_v2 * w2
-        version = "BLEND"
-    elif v1_score - v2_score > 0.05:
-        p_tai, version = p_v1, "V1"
-    elif v2_score - v1_score > 0.05:
-        p_tai, version = p_v2, "V2"
-    elif v1_conf > v2_conf:
-        p_tai, version = p_v1, "V1"
-    elif v2_conf > v1_conf:
-        p_tai, version = p_v2, "V2"
-    else:
-        p_tai, version = (p_v1 + p_v2) / 2, "BLEND"
-
-    predict = "TAI" if p_tai >= 0.5 else "XIU"
-    conf = max(p_tai, 1 - p_tai) * 100
-    if both_agree:
-        conf = min(80, conf + 5)
-
-    if conf >= 55:
-        tier = "STRONG"
-    elif conf >= 52:
-        predict = "XIU" if predict == "TAI" else "TAI"
-        p_tai = 1 - p_tai
-        conf = max(p_tai, 1 - p_tai) * 100
-        tier = "CONTRARIAN"
-    else:
-        return None
-
-    return {
-        "predict": predict,
-        "confidence": min(80, conf) / 100,
-        "p_tai": p_tai * 100,
-        "p_v1": p_v1 * 100,
-        "p_v2": p_v2 * 100,
-        "version": version,
-        "tier": tier,
-    }
-
-
-def predict_next(data):
-    seq = get_seq(data)
-    if len(seq) < 8:
-        return None, None, None
-    out = analyze(seq)
-    if not out:
-        return None, None, None
-    return out["predict"], out["confidence"] * 100, out
-
-
-# ================== HTML TEMPLATE (MỚI) ==================
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🎯 TXMD5 AI Predictor</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet">
-<style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-
-  :root {{
-    --tai: #ff3d68;
-    --tai-glow: rgba(255,61,104,0.6);
-    --xiu: #00e5a0;
-    --xiu-glow: rgba(0,229,160,0.6);
-    --purple: #7b5cff;
-    --blue: #00b4ff;
-  }}
-
-  body {{
-    font-family: 'Inter', -apple-system, sans-serif;
-    min-height: 100vh;
-    background: #0a0e27;
-    background-image:
-      radial-gradient(at 20% 10%, rgba(123,92,255,0.25) 0%, transparent 50%),
-      radial-gradient(at 80% 20%, rgba(0,180,255,0.20) 0%, transparent 50%),
-      radial-gradient(at 50% 90%, rgba(255,61,104,0.18) 0%, transparent 50%);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-    color: #fff;
-    overflow-x: hidden;
-    position: relative;
-  }}
-
-  /* Hạt sáng nền */
-  body::before {{
-    content: '';
-    position: fixed;
-    inset: 0;
-    background-image:
-      radial-gradient(2px 2px at 20% 30%, rgba(255,255,255,0.4), transparent),
-      radial-gradient(2px 2px at 60% 70%, rgba(255,255,255,0.3), transparent),
-      radial-gradient(1px 1px at 40% 50%, rgba(255,255,255,0.5), transparent),
-      radial-gradient(2px 2px at 90% 10%, rgba(255,255,255,0.35), transparent),
-      radial-gradient(1px 1px at 10% 90%, rgba(255,255,255,0.3), transparent);
-    background-size: 200% 200%;
-    animation: stars 8s ease-in-out infinite;
-    pointer-events: none;
-    z-index: 0;
-  }}
-  @keyframes stars {{
-    0%, 100% {{ background-position: 0% 0%; opacity: .7; }}
-    50% {{ background-position: 100% 100%; opacity: 1; }}
-  }}
-
-  .card {{
-    position: relative;
-    z-index: 1;
-    width: 100%;
-    max-width: 440px;
-    background: rgba(20, 25, 55, 0.65);
-    backdrop-filter: blur(24px) saturate(180%);
-    -webkit-backdrop-filter: blur(24px) saturate(180%);
-    border-radius: 28px;
-    padding: 32px 28px;
-    border: 1px solid rgba(255,255,255,0.12);
-    box-shadow:
-      0 30px 80px rgba(0,0,0,0.5),
-      0 0 0 1px rgba(255,255,255,0.05) inset,
-      0 0 60px rgba(123,92,255,0.15);
-    animation: fadeUp .6s cubic-bezier(.2,.8,.2,1);
-  }}
-  @keyframes fadeUp {{
-    from {{ opacity: 0; transform: translateY(20px) scale(.97); }}
-    to {{ opacity: 1; transform: translateY(0) scale(1); }}
-  }}
-
-  /* Header */
-  .header {{
-    text-align: center;
-    margin-bottom: 26px;
-  }}
-  .logo {{
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 18px;
-    background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 100px;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 1px;
-    color: #b8c4ff;
-    margin-bottom: 12px;
-  }}
-  .logo .dot {{
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: var(--xiu);
-    box-shadow: 0 0 12px var(--xiu-glow);
-    animation: pulse 2s infinite;
-  }}
-  @keyframes pulse {{
-    0%, 100% {{ opacity: 1; transform: scale(1); }}
-    50% {{ opacity: .5; transform: scale(.85); }}
-  }}
-  h1 {{
-    font-size: 26px;
-    font-weight: 900;
-    background: linear-gradient(135deg, #fff 0%, #b8c4ff 60%, #7b5cff 100%);
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    letter-spacing: -0.5px;
-  }}
-
-  /* Dự đoán chính */
-  .prediction {{
-    position: relative;
-    text-align: center;
-    padding: 30px 20px 26px;
-    border-radius: 24px;
-    margin-bottom: 22px;
-    overflow: hidden;
-    transition: all .3s;
-  }}
-  .prediction.tai {{
-    background: linear-gradient(135deg, rgba(255,61,104,0.18), rgba(255,61,104,0.05));
-    border: 1.5px solid rgba(255,61,104,0.4);
-    box-shadow: 0 0 40px rgba(255,61,104,0.25), inset 0 0 30px rgba(255,61,104,0.08);
-  }}
-  .prediction.xiu {{
-    background: linear-gradient(135deg, rgba(0,229,160,0.18), rgba(0,229,160,0.05));
-    border: 1.5px solid rgba(0,229,160,0.4);
-    box-shadow: 0 0 40px rgba(0,229,160,0.25), inset 0 0 30px rgba(0,229,160,0.08);
-  }}
-  .prediction::before {{
-    content: '';
-    position: absolute;
-    inset: -50%;
-    background: conic-gradient(from 0deg, transparent, rgba(255,255,255,0.1), transparent 30%);
-    animation: rotate 4s linear infinite;
-  }}
-  @keyframes rotate {{
-    to {{ transform: rotate(360deg); }}
-  }}
-  .prediction .inner {{ position: relative; z-index: 1; }}
-  .pred-label {{
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-    opacity: .7;
-    margin-bottom: 8px;
-  }}
-  .pred-value {{
-    font-size: 56px;
-    font-weight: 900;
-    letter-spacing: 4px;
-    line-height: 1;
-    margin-bottom: 8px;
-    animation: pop .5s cubic-bezier(.3,1.5,.5,1);
-  }}
-  @keyframes pop {{
-    0% {{ transform: scale(.5); opacity: 0; }}
-    100% {{ transform: scale(1); opacity: 1; }}
-  }}
-  .prediction.tai .pred-value {{
-    color: var(--tai);
-    text-shadow: 0 0 30px var(--tai-glow), 0 0 60px var(--tai-glow);
-  }}
-  .prediction.xiu .pred-value {{
-    color: var(--xiu);
-    text-shadow: 0 0 30px var(--xiu-glow), 0 0 60px var(--xiu-glow);
-  }}
-  .conf-badge {{
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 14px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 100px;
-    font-size: 13px;
-    font-weight: 700;
-    backdrop-filter: blur(10px);
-  }}
-  .conf-badge .icon {{ font-size: 14px; }}
-
-  /* Rows thông tin */
-  .info-grid {{
-    display: grid;
-    gap: 10px;
-    margin-bottom: 18px;
-  }}
-  .info-row {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 13px 16px;
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.06);
-    border-radius: 14px;
-    font-size: 14px;
-    transition: all .2s;
-  }}
-  .info-row:hover {{
-    background: rgba(255,255,255,0.08);
-    border-color: rgba(123,92,255,0.3);
-    transform: translateX(3px);
-  }}
-  .info-row .label {{
-    color: #8b96c9;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-weight: 500;
-  }}
-  .info-row .value {{
-    font-weight: 700;
-    color: #fff;
-  }}
-  .tag {{
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 100px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .5px;
-  }}
-  .tag-strong {{
-    background: linear-gradient(135deg, #00e5a0, #00b4ff);
-    color: #001a14;
-  }}
-  .tag-contra {{
-    background: linear-gradient(135deg, #ffb800, #ff7b00);
-    color: #2a1500;
-  }}
-  .tag-version {{
-    background: linear-gradient(135deg, #7b5cff, #b84dff);
-    color: #fff;
-  }}
-
-  /* Progress bars */
-  .bars {{
-    display: grid;
-    gap: 12px;
-    padding: 16px;
-    background: rgba(0,0,0,0.2);
-    border-radius: 16px;
-    margin-bottom: 18px;
-  }}
-  .bar-item {{ }}
-  .bar-head {{
-    display: flex;
-    justify-content: space-between;
-    font-size: 12px;
-    font-weight: 600;
-    margin-bottom: 6px;
-    color: #a8b3dd;
-  }}
-  .bar-track {{
-    height: 8px;
-    background: rgba(255,255,255,0.08);
-    border-radius: 100px;
-    overflow: hidden;
-  }}
-  .bar-fill {{
-    height: 100%;
-    border-radius: 100px;
-    transition: width 1s cubic-bezier(.2,.8,.2,1);
-  }}
-  .bar-v1 {{ background: linear-gradient(90deg, #7b5cff, #b84dff); }}
-  .bar-v2 {{ background: linear-gradient(90deg, #00b4ff, #00e5a0); }}
-  .bar-tai {{ background: linear-gradient(90deg, #ff3d68, #ff9a3d); }}
-
-  /* Lịch sử */
-  .history-chips {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding: 14px 16px;
-    background: rgba(0,0,0,0.2);
-    border-radius: 16px;
-    margin-bottom: 18px;
-  }}
-  .chip {{
-    width: 32px; height: 32px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 10px;
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: .5px;
-    transition: transform .2s;
-  }}
-  .chip:hover {{ transform: scale(1.15); }}
-  .chip.t {{ background: rgba(255,61,104,0.2); color: #ff7b9a; border: 1px solid rgba(255,61,104,0.4); }}
-  .chip.x {{ background: rgba(0,229,160,0.2); color: #4dffc8; border: 1px solid rgba(0,229,160,0.4); }}
-
-  /* Button */
-  .btn {{
-    width: 100%;
-    padding: 15px;
-    border: none;
-    border-radius: 16px;
-    background: linear-gradient(135deg, #7b5cff 0%, #b84dff 50%, #ff3d68 100%);
-    background-size: 200% 200%;
-    color: #fff;
-    font-size: 15px;
-    font-weight: 800;
-    letter-spacing: 1px;
-    cursor: pointer;
-    transition: all .3s;
-    box-shadow: 0 10px 30px rgba(123,92,255,0.4);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-  }}
-  .btn:hover {{
-    background-position: 100% 50%;
-    transform: translateY(-2px);
-    box-shadow: 0 15px 40px rgba(123,92,255,0.6);
-  }}
-  .btn:active {{ transform: translateY(0); }}
-
-  /* Footer */
-  .credit {{
-    text-align: center;
-    margin-top: 20px;
-    padding-top: 16px;
-    border-top: 1px solid rgba(255,255,255,0.08);
-    font-size: 12px;
-    color: #6b76a8;
-    font-weight: 500;
-  }}
-  .credit strong {{
-    background: linear-gradient(135deg, #7b5cff, #ff3d68);
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-weight: 800;
-  }}
-
-  .error {{
-    text-align: center;
-    padding: 40px 20px;
-    color: #ff7b9a;
-    font-weight: 600;
-  }}
-  .error .emoji {{ font-size: 40px; display: block; margin-bottom: 12px; }}
-
-  .time {{
-    text-align: center;
-    font-size: 11px;
-    color: #4d5a8a;
-    margin-top: 12px;
-    font-weight: 500;
-  }}
-
-  /* Nút phụ */
-  .nav-links {{
-    display: flex;
-    gap: 8px;
-    margin-top: 14px;
-  }}
-  .nav-links a {{
-    flex: 1;
-    text-align: center;
-    padding: 11px;
-    background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px;
-    color: #a8b3dd;
-    text-decoration: none;
-    font-size: 13px;
-    font-weight: 600;
-    transition: all .2s;
-  }}
-  .nav-links a:hover {{
-    background: rgba(123,92,255,0.15);
-    border-color: rgba(123,92,255,0.4);
-    color: #fff;
-  }}
-</style>
-</head>
-<body>
-  <div class="card">
-    <div class="header">
-      <div class="logo">
-        <span class="dot"></span>
-        AI PREDICTOR v2.0
-      </div>
-      <h1>TXMD5 Predictor</h1>
-    </div>
-    {content}
-    <div class="credit">Powered by <strong>{credit}</strong></div>
-  </div>
-</body>
-</html>
-"""
-
-
-def render_html(data):
-    if "error" in data:
-        content = f'''
-        <div class="error">
-          <span class="emoji">⚠️</span>
-          Lỗi nguồn dữ liệu<br><small style="opacity:.7">{data["error"]}</small>
-        </div>'''
-        return HTML_PAGE.format(content=content, credit=CREDIT)
-
-    pred, conf, meta = predict_next(data)
-    if pred is None:
-        content = '''
-        <div class="error">
-          <span class="emoji">⏳</span>
-          Chưa đủ dữ liệu để dự đoán<br>
-          <small style="opacity:.7">Cần ≥ 8 phiên và độ tin cậy ≥ 52%</small>
-        </div>'''
-        return HTML_PAGE.format(content=content, credit=CREDIT)
-
-    cls = "tai" if pred == "TAI" else "xiu"
-    rows = data.get("list", [])
-    last = rows[0] if rows else {}
-    phien = last.get("id", "-")
-    ket_qua = last.get("resultTruyenThong", "-")
-    dices = last.get("dices", [])
-    point = last.get("point", "-")
-
-    seq = get_seq(data)
-    chips = "".join(
-        f'<div class="chip {"t" if s=="TAI" else "x"}">{s[0]}</div>'
-        for s in seq[-20:]
-    )
-
-    tier_tag = "tag-strong" if meta["tier"] == "STRONG" else "tag-contra"
-    tier_text = "🔥 STRONG" if meta["tier"] == "STRONG" else "🔄 CONTRARIAN"
-
-    content = f'''
-    <div class="prediction {cls}">
-      <div class="inner">
-        <div class="pred-label">Dự đoán phiên tiếp</div>
-        <div class="pred-value">{pred}</div>
-        <div class="conf-badge">
-          <span class="icon">🎯</span>
-          Độ tin cậy: {conf:.1f}%
-        </div>
-      </div>
-    </div>
-
-    <div class="info-grid">
-      <div class="info-row">
-        <span class="label">🔢 Phiên hiện tại</span>
-        <span class="value">{phien}</span>
-      </div>
-      <div class="info-row">
-        <span class="label">🎲 Kết quả trước</span>
-        <span class="value">{ket_qua} {dices} ({point}đ)</span>
-      </div>
-      <div class="info-row">
-        <span class="label">🧠 Thuật toán</span>
-        <span class="value"><span class="tag tag-version">{meta["version"]}</span></span>
-      </div>
-      <div class="info-row">
-        <span class="label">⚡ Tín hiệu</span>
-        <span class="value"><span class="tag {tier_tag}">{tier_text}</span></span>
-      </div>
-    </div>
-
-    <div class="bars">
-      <div class="bar-item">
-        <div class="bar-head"><span>🎲 Xác suất TÀI</span><span>{meta["p_tai"]:.1f}%</span></div>
-        <div class="bar-track"><div class="bar-fill bar-tai" style="width:{meta["p_tai"]:.1f}%"></div></div>
-      </div>
-      <div class="bar-item">
-        <div class="bar-head"><span>🧩 V1 (Cổ điển)</span><span>{meta["p_v1"]:.1f}%</span></div>
-        <div class="bar-track"><div class="bar-fill bar-v1" style="width:{meta["p_v1"]:.1f}%"></div></div>
-      </div>
-      <div class="bar-item">
-        <div class="bar-head"><span>🚀 V2 (Hiện đại)</span><span>{meta["p_v2"]:.1f}%</span></div>
-        <div class="bar-track"><div class="bar-fill bar-v2" style="width:{meta["p_v2"]:.1f}%"></div></div>
-      </div>
-    </div>
-
-    <div class="history-chips">{chips}</div>
-
-    <button class="btn" onclick="location.reload()">🔄 LÀM MỚI DỰ ĐOÁN</button>
-
-    <div class="nav-links">
-      <a href="/history">📜 Lịch sử</a>
-      <a href="/dudoan">🔗 JSON API</a>
-    </div>
-
-    <div class="time">Cập nhật: {datetime.now().strftime("%H:%M:%S • %d/%m/%Y")}</div>
-    '''
-    return HTML_PAGE.format(content=content, credit=CREDIT)
-
-
-# ================== WORKER NỀN ==================
-def background_worker():
     last_phien = None
     while True:
         try:
             data = fetch_source()
             if "error" in data:
-                time.sleep(20)
+                time.sleep(2)
                 continue
-            rows = data.get("list", [])
-            if not rows:
-                time.sleep(15)
+
+            sessions = parse_sessions(data)
+            if not sessions:
+                time.sleep(2)
                 continue
-            phien = rows[0].get("id")
-            if phien and phien != last_phien:
-                pred, conf, meta = predict_next(data)
-                if pred is not None:
-                    history = load_history()
-                    if not any(h.get("phien") == phien for h in history):
-                        history.append({
-                            "phien": phien,
-                            "du_doan": pred,
-                            "do_tin_cay": f"{conf:.1f}%",
-                            "thuat_toan": meta["version"],
-                            "tier": meta["tier"],
-                            "ket_qua_phien_truoc": rows[0].get("resultTruyenThong"),
+
+            # Cập nhật lịch sử toàn cục
+            GLOBAL_HISTORY = sessions[-MAX_GLOBAL_HISTORY:]
+            newest = sessions[-1]
+            newest_id = newest["session"]
+
+            if newest_id != last_phien:
+                # ==== PHIÊN MỚI ====
+                last_phien = newest_id
+                latest_api_session_id = newest_id
+
+                pred = prediction(GLOBAL_HISTORY)
+                if pred["side"] in ("Tài", "Xỉu"):
+                    latest_prediction = {
+                        "session": newest_id,
+                        "predict_for_session": newest_id + 1,
+                        "du_doan": "TAI" if pred["side"] == "Tài" else "XIU",
+                        "side": pred["side"],
+                        "do_tin_cay": pred["conf"],
+                        "detail": pred["detail"],
+                        "last_result": newest["side"],
+                        "last_dice": newest["dice"],
+                        "last_total": newest["total"],
+                        "history_seq": [h["side"] for h in GLOBAL_HISTORY[-20:]],
+                        "thoi_gian": datetime.now().isoformat(timespec="seconds"),
+                        "poll_ts": time.time(),
+                    }
+                    prediction_version += 1
+
+                    # Lưu file history
+                    hist = load_history()
+                    if not any(h.get("phien") == newest_id for h in hist):
+                        hist.append({
+                            "phien": newest_id,
+                            "du_doan": latest_prediction["du_doan"],
+                            "do_tin_cay": f"{pred['conf']:.1f}%",
+                            "thuat_toan": "NEW_V3",
+                            "chi_tiet": pred["detail"],
+                            "ket_qua_phien": newest["side"],
                             "thoi_gian": datetime.now().isoformat(timespec="seconds"),
                         })
-                        save_history(history)
-                last_phien = phien
+                        save_history(hist)
+
+            # Poll nhanh khi chưa có phiên mới
+            time.sleep(1.2)
         except Exception:
-            pass
-        time.sleep(15)
+            time.sleep(2)
+
+
+# ================== HTML ==================
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎯 TXMD5 AI Predictor — Live</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  :root {{
+    --tai:#ff3d68; --tai-glow:rgba(255,61,104,.6);
+    --xiu:#00e5a0; --xiu-glow:rgba(0,229,160,.6);
+    --purple:#7b5cff; --blue:#00b4ff;
+  }}
+  body {{
+    font-family:'Inter',sans-serif; min-height:100vh;
+    background:#0a0e27;
+    background-image:
+      radial-gradient(at 20% 10%, rgba(123,92,255,.25) 0%, transparent 50%),
+      radial-gradient(at 80% 20%, rgba(0,180,255,.20) 0%, transparent 50%),
+      radial-gradient(at 50% 90%, rgba(255,61,104,.18) 0%, transparent 50%);
+    display:flex; align-items:center; justify-content:center;
+    padding:20px; color:#fff;
+  }}
+  .card {{
+    width:100%; max-width:440px;
+    background:rgba(20,25,55,.65); backdrop-filter:blur(24px);
+    border-radius:28px; padding:30px 26px;
+    border:1px solid rgba(255,255,255,.12);
+    box-shadow:0 30px 80px rgba(0,0,0,.5), 0 0 60px rgba(123,92,255,.15);
+  }}
+  .header {{ text-align:center; margin-bottom:22px; }}
+  .logo {{
+    display:inline-flex; align-items:center; gap:8px;
+    padding:7px 16px; background:rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.1); border-radius:100px;
+    font-size:12px; font-weight:600; letter-spacing:1px; color:#b8c4ff;
+    margin-bottom:10px;
+  }}
+  .logo .dot {{
+    width:8px; height:8px; border-radius:50%;
+    background:var(--xiu); box-shadow:0 0 12px var(--xiu-glow);
+    animation:pulse 1.4s infinite;
+  }}
+  @keyframes pulse {{ 0%,100%{{opacity:1;transform:scale(1)}} 50%{{opacity:.4;transform:scale(.8)}} }}
+  h1 {{
+    font-size:24px; font-weight:900;
+    background:linear-gradient(135deg,#fff,#b8c4ff 60%,#7b5cff);
+    -webkit-background-clip:text; background-clip:text;
+    -webkit-text-fill-color:transparent;
+  }}
+  .prediction {{
+    text-align:center; padding:28px 18px 24px; border-radius:22px;
+    margin-bottom:18px; transition:all .35s; position:relative; overflow:hidden;
+  }}
+  .prediction.tai {{
+    background:linear-gradient(135deg,rgba(255,61,104,.18),rgba(255,61,104,.05));
+    border:1.5px solid rgba(255,61,104,.4);
+    box-shadow:0 0 40px rgba(255,61,104,.25);
+  }}
+  .prediction.xiu {{
+    background:linear-gradient(135deg,rgba(0,229,160,.18),rgba(0,229,160,.05));
+    border:1.5px solid rgba(0,229,160,.4);
+    box-shadow:0 0 40px rgba(0,229,160,.25);
+  }}
+  .pred-label {{ font-size:11px; font-weight:700; letter-spacing:3px; opacity:.7; margin-bottom:8px; }}
+  .pred-value {{
+    font-size:52px; font-weight:900; letter-spacing:4px;
+    line-height:1; margin-bottom:8px;
+    animation:pop .5s cubic-bezier(.3,1.5,.5,1);
+  }}
+  @keyframes pop {{ 0%{{transform:scale(.5);opacity:0}} 100%{{transform:scale(1);opacity:1}} }}
+  .prediction.tai .pred-value {{ color:var(--tai); text-shadow:0 0 30px var(--tai-glow); }}
+  .prediction.xiu .pred-value {{ color:var(--xiu); text-shadow:0 0 30px var(--xiu-glow); }}
+  .conf-badge {{
+    display:inline-flex; align-items:center; gap:6px;
+    padding:6px 14px; background:rgba(255,255,255,.1);
+    border-radius:100px; font-size:13px; font-weight:700;
+  }}
+  .live-tag {{
+    display:inline-block; margin-left:8px; padding:3px 9px;
+    background:rgba(0,229,160,.2); border:1px solid rgba(0,229,160,.5);
+    color:#4dffc8; border-radius:100px; font-size:10px; font-weight:800;
+    letter-spacing:1px;
+  }}
+  .live-tag.off {{ background:rgba(255,61,104,.15); border-color:rgba(255,61,104,.5); color:#ff7b9a; }}
+  .info-grid {{ display:grid; gap:9px; margin-bottom:16px; }}
+  .info-row {{
+    display:flex; justify-content:space-between; align-items:center;
+    padding:12px 15px; background:rgba(255,255,255,.04);
+    border:1px solid rgba(255,255,255,.06); border-radius:13px; font-size:13px;
+  }}
+  .info-row .label {{ color:#8b96c9; display:flex; align-items:center; gap:7px; font-weight:500; }}
+  .info-row .value {{ font-weight:700; }}
+  .tag {{
+    display:inline-block; padding:3px 9px; border-radius:100px;
+    font-size:11px; font-weight:700; letter-spacing:.5px;
+  }}
+  .tag-version {{ background:linear-gradient(135deg,#7b5cff,#b84dff); color:#fff; }}
+  .bars {{ display:grid; gap:10px; padding:14px; background:rgba(0,0,0,.2); border-radius:14px; margin-bottom:16px; }}
+  .bar-head {{ display:flex; justify-content:space-between; font-size:11px; font-weight:600; margin-bottom:5px; color:#a8b3dd; }}
+  .bar-track {{ height:7px; background:rgba(255,255,255,.08); border-radius:100px; overflow:hidden; }}
+  .bar-fill {{ height:100%; border-radius:100px; transition:width .8s cubic-bezier(.2,.8,.2,1); }}
+  .bar-tai {{ background:linear-gradient(90deg,#ff3d68,#ff9a3d); }}
+  .bar-v1 {{ background:linear-gradient(90deg,#7b5cff,#b84dff); }}
+  .bar-v2 {{ background:linear-gradient(90deg,#00b4ff,#00e5a0); }}
+  .history-chips {{
+    display:flex; flex-wrap:wrap; gap:5px; padding:12px 14px;
+    background:rgba(0,0,0,.2); border-radius:14px; margin-bottom:14px;
+  }}
+  .chip {{
+    width:30px; height:30px; display:flex; align-items:center; justify-content:center;
+    border-radius:9px; font-size:10px; font-weight:800;
+  }}
+  .chip.t {{ background:rgba(255,61,104,.2); color:#ff7b9a; border:1px solid rgba(255,61,104,.4); }}
+  .chip.x {{ background:rgba(0,229,160,.2); color:#4dffc8; border:1px solid rgba(0,229,160,.4); }}
+  .btn {{
+    width:100%; padding:14px; border:none; border-radius:14px;
+    background:linear-gradient(135deg,#7b5cff,#b84dff 50%,#ff3d68);
+    background-size:200% 200%; color:#fff; font-size:14px; font-weight:800;
+    letter-spacing:1px; cursor:pointer; transition:all .3s;
+    box-shadow:0 10px 30px rgba(123,92,255,.4);
+  }}
+  .btn:hover {{ background-position:100% 50%; transform:translateY(-2px); }}
+  .credit {{ text-align:center; margin-top:16px; padding-top:14px; border-top:1px solid rgba(255,255,255,.08); font-size:11px; color:#6b76a8; }}
+  .credit strong {{ background:linear-gradient(135deg,#7b5cff,#ff3d68); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }}
+  .time {{ text-align:center; font-size:11px; color:#4d5a8a; margin-top:10px; }}
+  .error {{ text-align:center; padding:40px 20px; color:#ff7b9a; font-weight:600; }}
+  .error .emoji {{ font-size:40px; display:block; margin-bottom:10px; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="logo"><span class="dot"></span> AI PREDICTOR · LIVE v3</div>
+      <h1>TXMD5 Predictor</h1>
+    </div>
+    <div id="app-content">{content}</div>
+    <div class="credit">Powered by <strong>{credit}</strong></div>
+  </div>
+<script>
+const clientVersion = {{version}};
+let currentVersion = clientVersion;
+
+async function refresh() {{
+  try {{
+    const r = await fetch('/api/live?since=' + currentVersion, {{cache:'no-store'}});
+    const j = await r.json();
+    if (j.version > currentVersion) {{
+      currentVersion = j.version;
+      document.getElementById('app-content').innerHTML = j.html;
+      document.getElementById('live-dot')?.classList.add('on');
+    }}
+    document.getElementById('last-update').textContent = j.server_time || '';
+  }} catch(e) {{}}
+  setTimeout(refresh, 800);
+}}
+refresh();
+</script>
+</body>
+</html>
+"""
+
+
+def render_content():
+    """Render HTML fragment từ latest_prediction (không có thẻ html/body)."""
+    global latest_prediction
+    p = latest_prediction
+    if not p:
+        return '''
+        <div class="error">
+          <span class="emoji">⏳</span>
+          Đang chờ phiên mới từ API...<br>
+          <small style="opacity:.7">Hệ thống sẽ tự cập nhật khi có kết quả</small>
+        </div>'''
+
+    side = p["side"]
+    cls = "tai" if side == "Tài" else "xiu"
+    conf = p["do_tin_cay"]
+    d = p["detail"]
+
+    chips = "".join(
+        f'<div class="chip {"t" if s=="Tài" else "x"}">{s[0]}</div>'
+        for s in p["history_seq"][-20:]
+    )
+
+    return f'''
+    <div class="prediction {cls}">
+      <div class="pred-label">Dự đoán phiên {p["predict_for_session"]}</div>
+      <div class="pred-value">{p["du_doan"]}</div>
+      <div class="conf-badge">
+        🎯 {conf:.1f}%
+        <span class="live-tag" id="live-dot">● LIVE</span>
+      </div>
+    </div>
+    <div class="info-grid">
+      <div class="info-row"><span class="label">🔢 Phiên vừa xong</span><span class="value">{p["session"]}</span></div>
+      <div class="info-row"><span class="label">🎲 Kết quả</span><span class="value">{side.upper() if False else ("TAI" if p["last_result"]=="Tài" else "XIU")} {p["last_dice"]} ({p["last_total"]}đ)</span></div>
+      <div class="info-row"><span class="label">🧠 Thuật toán</span><span class="value"><span class="tag tag-version">NEW V3</span></span></div>
+    </div>
+    <div class="bars">
+      <div class="bar-head"><span>🎲 P(TÀI)</span><span>{d["p_tai"]:.1f}%</span></div>
+      <div class="bar-track"><div class="bar-fill bar-tai" style="width:{d["p_tai"]:.1f}%"></div></div>
+      <div class="bar-head" style="margin-top:8px"><span>📊 Weighted 12</span><span>{d["p_weighted"]:.1f}%</span></div>
+      <div class="bar-track"><div class="bar-fill bar-v1" style="width:{d["p_weighted"]:.1f}%"></div></div>
+      <div class="bar-head" style="margin-top:8px"><span>🔗 Markov</span><span>{d["p_markov"]:.1f}%</span></div>
+      <div class="bar-track"><div class="bar-fill bar-v2" style="width:{d["p_markov"]:.1f}%"></div></div>
+    </div>
+    <div class="history-chips">{chips}</div>
+    <div class="time" id="last-update">Cập nhật: {p["thoi_gian"]}</div>
+    '''
+
+
+def render_html():
+    content = render_content()
+    ver = prediction_version
+    return HTML_PAGE.format(content=content, credit=CREDIT, version=ver)
 
 
 # ================== ROUTES ==================
@@ -977,102 +528,86 @@ def add_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers.pop("X-Frame-Options", None)
-    resp.headers["Content-Security-Policy"] = "frame-ancestors *"
     return resp
-
-
-@app.route("/dudoan")
-def dudoan():
-    data = fetch_source()
-    if "error" in data:
-        return Response(
-            json.dumps({"status": "error", "message": data["error"]}, ensure_ascii=False, indent=2),
-            mimetype="application/json; charset=utf-8"
-        ), 500
-
-    pred, conf, meta = predict_next(data)
-    if pred is None:
-        return Response(
-            json.dumps({"status": "no_data", "message": "Chưa đủ dữ liệu hoặc conf < 52%"}, ensure_ascii=False, indent=2),
-            mimetype="application/json; charset=utf-8"
-        ), 200
-
-    rows = data.get("list", [])
-    last = rows[0] if rows else {}
-
-    phien = last.get("id")
-    history = load_history()
-    if phien and not any(h.get("phien") == phien for h in history):
-        history.append({
-            "phien": phien,
-            "du_doan": pred,
-            "do_tin_cay": f"{conf:.1f}%",
-            "thuat_toan": meta["version"],
-            "tier": meta["tier"],
-            "ket_qua_phien_truoc": last.get("resultTruyenThong"),
-            "thoi_gian": datetime.now().isoformat(timespec="seconds"),
-        })
-        save_history(history)
-
-    payload = {
-        "du_doan": pred,
-        "do_tin_cay": f"{conf:.1f}%",
-        "phien": phien,
-        "ket_qua_truoc": last.get("resultTruyenThong"),
-        "thuat_toan": meta["version"],
-        "tier": meta["tier"],
-        "p_tai": round(meta["p_tai"], 2),
-        "p_v1": round(meta["p_v1"], 2),
-        "p_v2": round(meta["p_v2"], 2),
-        "lich_su": " ".join(get_seq(data)[-10:]),
-    }
-    return Response(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        mimetype="application/json; charset=utf-8"
-    )
 
 
 @app.route("/")
 @app.route("/predict")
 def predict_page():
-    data = fetch_source()
-    return Response(render_html(data), mimetype="text/html; charset=utf-8")
+    return Response(render_html(), mimetype="text/html; charset=utf-8")
+
+
+@app.route("/api/live")
+def api_live():
+    """Endpoint cho frontend polling — trả về version + HTML fragment mới."""
+    since = int(request.args.get("since", 0))
+    if prediction_version > since or True:
+        html = render_content()
+    else:
+        html = ""
+    return Response(json.dumps({
+        "version": prediction_version,
+        "html": html,
+        "server_time": datetime.now().strftime("%H:%M:%S • %d/%m/%Y"),
+        "latest": latest_prediction,
+    }, ensure_ascii=False), mimetype="application/json; charset=utf-8")
+
+
+@app.route("/dudoan")
+def dudoan():
+    if not latest_prediction:
+        return Response(json.dumps({
+            "status": "waiting", "message": "Chưa có phiên mới"
+        }, ensure_ascii=False, indent=2), mimetype="application/json; charset=utf-8")
+    return Response(json.dumps({
+        "status": "ok",
+        "du_doan": latest_prediction["du_doan"],
+        "do_tin_cay": f"{latest_prediction['do_tin_cay']:.1f}%",
+        "phien": latest_prediction["session"],
+        "du_doan_cho_phien": latest_prediction["predict_for_session"],
+        "ket_qua_truoc": latest_prediction["last_result"],
+        "thuat_toan": "NEW_V3",
+        "chi_tiet": latest_prediction["detail"],
+        "version": prediction_version,
+    }, ensure_ascii=False, indent=2), mimetype="application/json; charset=utf-8")
+
+
+@app.route("/stream")
+def stream():
+    """SSE — đẩy dự đoán mới ngay khi có phiên mới."""
+    def gen():
+        last_v = -1
+        yield f"data: {json.dumps({'hello': True, 'version': prediction_version})}\n\n"
+        while True:
+            if prediction_version != last_v and latest_prediction:
+                last_v = prediction_version
+                payload = json.dumps(latest_prediction, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+            time.sleep(0.8)
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.route("/history")
 def history_page():
     h = load_history()
-    chips = "".join(
-        f'<div class="chip {"t" if x.get("du_doan")=="TAI" else "x"}">{x.get("du_doan","")[0]}</div>'
-        for x in reversed(h[-40:])
-    ) or '<p style="color:#6b76a8;text-align:center;padding:20px">Chưa có lịch sử</p>'
-
-    rows_html = "".join(
-        f'<div class="info-row">'
-        f'<span class="label">🔢 Phiên {x.get("phien")}</span>'
-        f'<span class="value">{x.get("du_doan")} • {x.get("do_tin_cay")}</span>'
-        f'</div>'
+    rows = "".join(
+        f'<div class="info-row"><span class="label">🔢 {x.get("phien")}</span>'
+        f'<span class="value">{x.get("du_doan")} • {x.get("do_tin_cay")}</span></div>'
         for x in reversed(h[-30:])
-    ) or ''
-
+    ) or '<p style="text-align:center;color:#6b76a8;padding:20px">Chưa có lịch sử</p>'
     content = f'''
-    <div class="header" style="margin-bottom:20px">
-      <h1 style="font-size:22px">📜 Lịch sử dự đoán</h1>
-      <p style="color:#8b96c9;font-size:13px;margin-top:8px">Tổng: {len(h)} phiên</p>
+    <div class="header" style="margin-bottom:18px">
+      <h1 style="font-size:20px">📜 Lịch sử</h1>
+      <p style="color:#8b96c9;font-size:12px;margin-top:6px">Tổng: {len(h)} phiên</p>
     </div>
-    <div class="history-chips" style="margin-bottom:20px">{chips}</div>
-    <div class="info-grid">{rows_html}</div>
-    <div class="nav-links">
-      <a href="/">🏠 Trang chủ</a>
-      <a href="/dudoan">🔗 JSON</a>
-    </div>
-    '''
-    return Response(HTML_PAGE.format(content=content, credit=CREDIT), mimetype="text/html; charset=utf-8")
+    <div class="info-grid">{rows}</div>'''
+    return Response(HTML_PAGE.format(content=content, credit=CREDIT, version=prediction_version),
+                    mimetype="text/html; charset=utf-8")
 
 
-# ================== KHỞI ĐỘNG ==================
+# ================== START ==================
 if __name__ == "__main__":
-    threading.Thread(target=background_worker, daemon=True).start()
+    threading.Thread(target=realtime_worker, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
